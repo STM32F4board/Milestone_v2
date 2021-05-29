@@ -1,0 +1,17 @@
+keyword-spotting-02-v3/edge-impulse-sdk/tensorflow/lite/micro/micro_error_reporter.o: \
+ ../keyword-spotting-02-v3/edge-impulse-sdk/tensorflow/lite/micro/micro_error_reporter.cc \
+ E:/Unistudy/Master/rubbish\ software/Milestone_v2/keyword-spotting-02-v3/edge-impulse-sdk/tensorflow/lite/micro/micro_error_reporter.h \
+ E:/Unistudy/Master/rubbish\ software/Milestone_v2/keyword-spotting-02-v3/edge-impulse-sdk/tensorflow/lite/core/api/error_reporter.h \
+ E:/Unistudy/Master/rubbish\ software/Milestone_v2/keyword-spotting-02-v3/edge-impulse-sdk/tensorflow/lite/micro/compatibility.h \
+ E:/Unistudy/Master/rubbish\ software/Milestone_v2/keyword-spotting-02-v3/edge-impulse-sdk/tensorflow/lite/micro/debug_log.h \
+ E:/Unistudy/Master/rubbish\ software/Milestone_v2/keyword-spotting-02-v3/edge-impulse-sdk/tensorflow/lite/micro/micro_string.h
+
+E:/Unistudy/Master/rubbish\ software/Milestone_v2/keyword-spotting-02-v3/edge-impulse-sdk/tensorflow/lite/micro/micro_error_reporter.h:
+
+E:/Unistudy/Master/rubbish\ software/Milestone_v2/keyword-spotting-02-v3/edge-impulse-sdk/tensorflow/lite/core/api/error_reporter.h:
+
+E:/Unistudy/Master/rubbish\ software/Milestone_v2/keyword-spotting-02-v3/edge-impulse-sdk/tensorflow/lite/micro/compatibility.h:
+
+E:/Unistudy/Master/rubbish\ software/Milestone_v2/keyword-spotting-02-v3/edge-impulse-sdk/tensorflow/lite/micro/debug_log.h:
+
+E:/Unistudy/Master/rubbish\ software/Milestone_v2/keyword-spotting-02-v3/edge-impulse-sdk/tensorflow/lite/micro/micro_string.h:
