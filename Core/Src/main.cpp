@@ -23,27 +23,31 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdarg.h>
-#include <stdio.h>
-#include "classifier/ei_run_classifier.h"
-
+#include "ei_run_classifier.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+
 /** Audio buffers, pointers and selectors */
-typedef struct {
-    int16_t *buffers[2];
-    uint8_t buf_select;
-    volatile uint8_t buf_ready;
-    uint32_t buf_count;
-    uint32_t n_samples;
+typedef struct
+{
+  int16_t *buffers[2];
+  uint8_t buf_select;
+  volatile uint8_t buf_ready;
+  volatile uint32_t buf_count;
+  uint32_t n_samples;
 } inference_t;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define I2S_BUF_LEN 6400  // 4x desired size to downsample and throw out 1 ch
-#define I2S_BUF_SKIP 4    // (2x L/R ch) * (2x sample rate)
+
+#define I2S_BUF_LEN 6400  // 8x desired size to downsample and throw out 1 ch
+#define I2S_BUF_SKIP 8    // (2x L/R ch) * (2x sample rate)
+#define ELEMENTS_PER_WORD 2	// Number buffer elements per 32-bit word
+int time = 500;
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -52,39 +56,46 @@ typedef struct {
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
-CRC_HandleTypeDef hcrc;
+I2S_HandleTypeDef hi2s2;
+DMA_HandleTypeDef hdma_spi2_rx;
 
-SAI_HandleTypeDef hsai_BlockB1;
-DMA_HandleTypeDef hdma_sai1_b;
+TIM_HandleTypeDef htim14;
 
-UART_HandleTypeDef huart2;
+UART_HandleTypeDef huart6;
 
 /* USER CODE BEGIN PV */
+
 // Settings
 static bool debug_nn = false; // Set this to true to see e.g. features generated from the raw signal
 
 // Globals
-uint32_t i2s_buf[I2S_BUF_LEN];
+uint16_t i2s_buf[I2S_BUF_LEN + 2];
 static inference_t inference;
-static bool record_ready = false;
-int time = 200;
-int Sound_State = 0;
+static volatile bool record_ready = false;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
-static void MX_USART2_UART_Init(void);
-static void MX_SAI1_Init(void);
-static void MX_CRC_Init(void);
+static void MX_I2S2_Init(void);
+static void MX_TIM14_Init(void);
+static void MX_USART6_UART_Init(void);
 /* USER CODE BEGIN PFP */
+
 static int get_audio_signal_data(size_t offset, size_t length, float *out_ptr);
 static void audio_buffer_inference_callback(uint32_t n_bytes, uint32_t offset);
 bool ei_microphone_inference_record(void);
 bool ei_microphone_inference_end(void);
 void ei_printf(const char *format, ...);
 void vprint(const char *fmt, va_list argp);
+void forward(void);
+void backward(void);
+void left(void);
+void right(void);
+void stop(void);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -99,9 +110,10 @@ void vprint(const char *fmt, va_list argp);
 int main(void)
 {
   /* USER CODE BEGIN 1 */
-	  HAL_StatusTypeDef hal_res;
-	  int print_results = -(EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW);
-	  uint32_t timestamp = 0;
+  HAL_StatusTypeDef hal_res;
+  int print_results = -(EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW);
+  uint32_t timestamp = 0;
+
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -123,10 +135,11 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_DMA_Init();
-  MX_USART2_UART_Init();
-  MX_SAI1_Init();
-  MX_CRC_Init();
+  MX_I2S2_Init();
+  MX_TIM14_Init();
+  MX_USART6_UART_Init();
   /* USER CODE BEGIN 2 */
+  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
   // Say some stuff
   ei_printf("Inferencing settings:\r\n");
   ei_printf("\tInterval: %.2f ms.\r\n", (float)EI_CLASSIFIER_INTERVAL_MS);
@@ -145,14 +158,19 @@ int main(void)
   {
     ei_printf("ERROR: Could not create buffer 2. Likely ran out of heap memory.\r\n");
   }
+
   // Set inference parameters
   inference.buf_select = 0;
   inference.buf_count  = 0;
   inference.n_samples  = EI_CLASSIFIER_SLICE_SIZE;
   inference.buf_ready  = 0;
 
+  // Add guard to I2S buffer
+  i2s_buf[I2S_BUF_LEN] = 0xbeef;
+  i2s_buf[I2S_BUF_LEN + 1] = 0xbeef;
+
   // Start receiving I2S audio data
-  hal_res =  HAL_SAI_Receive_DMA(&hsai_BlockB1, (uint8_t *)i2s_buf, I2S_BUF_LEN);
+  hal_res =  HAL_I2S_Receive_DMA(&hi2s2, i2s_buf, (I2S_BUF_LEN / ELEMENTS_PER_WORD));
   if (hal_res != HAL_OK)
   {
     ei_printf("ERROR: Could not initialize I2S microphone.\r\n");
@@ -161,13 +179,20 @@ int main(void)
   // Start doing inference
   record_ready = true;
 
+  if (record_ready)
+  {
+    ei_printf("Listening!\r\n");
+  }
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+
   while (1)
   {
-	  ei_printf("Point A\n");
+    //ei_printf("Waiting...");
+
     // Wait until buffer is full
     bool m = ei_microphone_inference_record();
     if (!m)
@@ -175,6 +200,9 @@ int main(void)
       ei_printf("ERROR: Audio buffer overrun\r\n");
       break;
     }
+
+    //ei_printf("Inferencing...");
+
     // Do classification (i.e. the inference part)
     signal_t signal;
     signal.total_length = EI_CLASSIFIER_SLICE_SIZE;
@@ -183,55 +211,63 @@ int main(void)
     EI_IMPULSE_ERROR r = run_classifier_continuous(&signal, &result, debug_nn);
     if (r != EI_IMPULSE_OK)
     {
-        ei_printf("ERROR: Failed to run classifier (%d)\r\n", r);
-        break;
+	ei_printf("ERROR: Failed to run classifier (%d)\r\n", r);
+	break;
     }
 
+    //ei_printf("Done!\r\n");
+
     // Print output predictions (once every 4 predictions)
-    ei_printf("in for\n");
     if(++print_results >= (EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW >> 1))
     {
       // Comment this section out if you don't want to see the raw scores
       ei_printf("Predictions (DSP: %d ms, NN: %d ms)\r\n", result.timing.dsp, result.timing.classification);
       for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++)
       {
-          ei_printf("    %s: %.5f\r\n", result.classification[ix].label, result.classification[ix].value);
+	  ei_printf("    %s: %.5f\r\n", result.classification[ix].label, result.classification[ix].value);
       }
       print_results = 0;
     }
-    ei_printf("No\n");
+
     // ***EXAMPLES***
 
     // Your code goes here
     // Note: see model_metadata.h for labels and indices
 
     // Example: print if "yes" is above 0.5 threshold
-    if (result.classification[3].value > 0.5)
-    {
-      ei_printf("YES!\r\n");
-    }
-
-    // Example: flash LED if "no" is above 0.5 threshold
     if (result.classification[0].value > 0.5)
     {
-      HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET);
-    }
-    else
+    	backward();
+    } else if (result.classification[1].value > 0.5)
     {
-      HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
+    	forward();
+    } else if (result.classification[3].value > 0.20)
+    {
+    	right();
+    } else if (result.classification[2].value > 0.45)
+    {
+    	left();
+    } else if (result.classification[4].value > 0.5)
+    {
+    	stop();
+    	HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
+    }
+    //if (result.classification[1].value > 0.4) {
+    else {
+    	stop();
+    	HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
     }
 
     // ***END OF EXAMPLES***
-
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
   }
 
   ei_microphone_inference_end();
+
   /* USER CODE END 3 */
 }
-
 
 /**
   * @brief System Clock Configuration
@@ -246,17 +282,16 @@ void SystemClock_Config(void)
   /** Configure the main internal regulator output voltage
   */
   __HAL_RCC_PWR_CLK_ENABLE();
-  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
-  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
-  RCC_OscInitStruct.PLL.PLLM = 8;
-  RCC_OscInitStruct.PLL.PLLN = 84;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 6;
+  RCC_OscInitStruct.PLL.PLLN = 168;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = 2;
   RCC_OscInitStruct.PLL.PLLR = 2;
@@ -270,20 +305,22 @@ void SystemClock_Config(void)
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK)
   {
     Error_Handler();
   }
-  PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_SAI1;
-  PeriphClkInitStruct.PLLSAI.PLLSAIM = 16;
-  PeriphClkInitStruct.PLLSAI.PLLSAIN = 192;
-  PeriphClkInitStruct.PLLSAI.PLLSAIQ = 2;
-  PeriphClkInitStruct.PLLSAI.PLLSAIP = RCC_PLLSAIP_DIV2;
-  PeriphClkInitStruct.PLLSAIDivQ = 1;
-  PeriphClkInitStruct.Sai1ClockSelection = RCC_SAI1CLKSOURCE_PLLSAI;
+  PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_I2S_APB1|RCC_PERIPHCLK_TIM;
+  PeriphClkInitStruct.PLLI2S.PLLI2SN = 50;
+  PeriphClkInitStruct.PLLI2S.PLLI2SP = RCC_PLLI2SP_DIV2;
+  PeriphClkInitStruct.PLLI2S.PLLI2SM = 6;
+  PeriphClkInitStruct.PLLI2S.PLLI2SR = 2;
+  PeriphClkInitStruct.PLLI2S.PLLI2SQ = 2;
+  PeriphClkInitStruct.PLLI2SDivQ = 1;
+  PeriphClkInitStruct.TIMPresSelection = RCC_TIMPRES_ACTIVATED;
+  PeriphClkInitStruct.I2sApb1ClockSelection = RCC_I2SAPB1CLKSOURCE_PLLI2S;
   if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK)
   {
     Error_Handler();
@@ -291,98 +328,100 @@ void SystemClock_Config(void)
 }
 
 /**
-  * @brief CRC Initialization Function
+  * @brief I2S2 Initialization Function
   * @param None
   * @retval None
   */
-static void MX_CRC_Init(void)
+static void MX_I2S2_Init(void)
 {
 
-  /* USER CODE BEGIN CRC_Init 0 */
+  /* USER CODE BEGIN I2S2_Init 0 */
 
-  /* USER CODE END CRC_Init 0 */
+  /* USER CODE END I2S2_Init 0 */
 
-  /* USER CODE BEGIN CRC_Init 1 */
+  /* USER CODE BEGIN I2S2_Init 1 */
 
-  /* USER CODE END CRC_Init 1 */
-  hcrc.Instance = CRC;
-  if (HAL_CRC_Init(&hcrc) != HAL_OK)
+  /* USER CODE END I2S2_Init 1 */
+  hi2s2.Instance = SPI2;
+  hi2s2.Init.Mode = I2S_MODE_MASTER_RX;
+  hi2s2.Init.Standard = I2S_STANDARD_PHILIPS;
+  hi2s2.Init.DataFormat = I2S_DATAFORMAT_24B;
+  hi2s2.Init.MCLKOutput = I2S_MCLKOUTPUT_DISABLE;
+  hi2s2.Init.AudioFreq = I2S_AUDIOFREQ_32K;
+  hi2s2.Init.CPOL = I2S_CPOL_LOW;
+  hi2s2.Init.ClockSource = I2S_CLOCK_PLL;
+  hi2s2.Init.FullDuplexMode = I2S_FULLDUPLEXMODE_DISABLE;
+  if (HAL_I2S_Init(&hi2s2) != HAL_OK)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN CRC_Init 2 */
+  /* USER CODE BEGIN I2S2_Init 2 */
 
-  /* USER CODE END CRC_Init 2 */
+  /* USER CODE END I2S2_Init 2 */
 
 }
 
 /**
-  * @brief SAI1 Initialization Function
+  * @brief TIM14 Initialization Function
   * @param None
   * @retval None
   */
-static void MX_SAI1_Init(void)
+static void MX_TIM14_Init(void)
 {
 
-  /* USER CODE BEGIN SAI1_Init 0 */
+  /* USER CODE BEGIN TIM14_Init 0 */
 
-  /* USER CODE END SAI1_Init 0 */
+  /* USER CODE END TIM14_Init 0 */
 
-  /* USER CODE BEGIN SAI1_Init 1 */
+  /* USER CODE BEGIN TIM14_Init 1 */
 
-  /* USER CODE END SAI1_Init 1 */
-  hsai_BlockB1.Instance = SAI1_Block_B;
-  hsai_BlockB1.Init.AudioMode = SAI_MODEMASTER_TX;
-  hsai_BlockB1.Init.Synchro = SAI_ASYNCHRONOUS;
-  hsai_BlockB1.Init.OutputDrive = SAI_OUTPUTDRIVE_DISABLE;
-  hsai_BlockB1.Init.NoDivider = SAI_MASTERDIVIDER_ENABLE;
-  hsai_BlockB1.Init.FIFOThreshold = SAI_FIFOTHRESHOLD_EMPTY;
-  hsai_BlockB1.Init.ClockSource = SAI_CLKSOURCE_NA;
-  hsai_BlockB1.Init.AudioFrequency = SAI_AUDIO_FREQUENCY_192K;
-  hsai_BlockB1.Init.SynchroExt = SAI_SYNCEXT_DISABLE;
-  hsai_BlockB1.Init.MonoStereoMode = SAI_STEREOMODE;
-  hsai_BlockB1.Init.CompandingMode = SAI_NOCOMPANDING;
-  hsai_BlockB1.Init.TriState = SAI_OUTPUT_NOTRELEASED;
-  if (HAL_SAI_InitProtocol(&hsai_BlockB1, SAI_I2S_STANDARD, SAI_PROTOCOL_DATASIZE_16BIT, 2) != HAL_OK)
+  /* USER CODE END TIM14_Init 1 */
+  htim14.Instance = TIM14;
+  htim14.Init.Prescaler = 8400 - 1;
+  htim14.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim14.Init.Period = 65535;
+  htim14.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim14.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim14) != HAL_OK)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN SAI1_Init 2 */
+  /* USER CODE BEGIN TIM14_Init 2 */
 
-  /* USER CODE END SAI1_Init 2 */
+  /* USER CODE END TIM14_Init 2 */
 
 }
 
 /**
-  * @brief USART2 Initialization Function
+  * @brief USART6 Initialization Function
   * @param None
   * @retval None
   */
-static void MX_USART2_UART_Init(void)
+static void MX_USART6_UART_Init(void)
 {
 
-  /* USER CODE BEGIN USART2_Init 0 */
+  /* USER CODE BEGIN USART6_Init 0 */
 
-  /* USER CODE END USART2_Init 0 */
+  /* USER CODE END USART6_Init 0 */
 
-  /* USER CODE BEGIN USART2_Init 1 */
+  /* USER CODE BEGIN USART6_Init 1 */
 
-  /* USER CODE END USART2_Init 1 */
-  huart2.Instance = USART2;
-  huart2.Init.BaudRate = 115200;
-  huart2.Init.WordLength = UART_WORDLENGTH_8B;
-  huart2.Init.StopBits = UART_STOPBITS_1;
-  huart2.Init.Parity = UART_PARITY_NONE;
-  huart2.Init.Mode = UART_MODE_TX_RX;
-  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
-  if (HAL_UART_Init(&huart2) != HAL_OK)
+  /* USER CODE END USART6_Init 1 */
+  huart6.Instance = USART6;
+  huart6.Init.BaudRate = 115200;
+  huart6.Init.WordLength = UART_WORDLENGTH_8B;
+  huart6.Init.StopBits = UART_STOPBITS_1;
+  huart6.Init.Parity = UART_PARITY_NONE;
+  huart6.Init.Mode = UART_MODE_TX_RX;
+  huart6.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart6.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart6) != HAL_OK)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN USART2_Init 2 */
+  /* USER CODE BEGIN USART6_Init 2 */
 
-  /* USER CODE END USART2_Init 2 */
+  /* USER CODE END USART6_Init 2 */
 
 }
 
@@ -393,12 +432,12 @@ static void MX_DMA_Init(void)
 {
 
   /* DMA controller clock enable */
-  __HAL_RCC_DMA2_CLK_ENABLE();
+  __HAL_RCC_DMA1_CLK_ENABLE();
 
   /* DMA interrupt init */
-  /* DMA2_Stream4_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA2_Stream4_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(DMA2_Stream4_IRQn);
+  /* DMA1_Stream3_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream3_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream3_IRQn);
 
 }
 
@@ -412,55 +451,71 @@ static void MX_GPIO_Init(void)
   GPIO_InitTypeDef GPIO_InitStruct = {0};
 
   /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, LD2_Pin|RR_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, RF_Pin|LF_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, LF_Pin|RR_Pin|LR_Pin|RF_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(LR_GPIO_Port, LR_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin : B1_Pin */
-  GPIO_InitStruct.Pin = B1_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : LD2_Pin RR_Pin */
-  GPIO_InitStruct.Pin = LD2_Pin|RR_Pin;
+  /*Configure GPIO pin : LD2_Pin */
+  GPIO_InitStruct.Pin = LD2_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : RF_Pin LF_Pin */
-  GPIO_InitStruct.Pin = RF_Pin|LF_Pin;
+  /*Configure GPIO pins : LF_Pin RR_Pin LR_Pin RF_Pin */
+  GPIO_InitStruct.Pin = LF_Pin|RR_Pin|LR_Pin|RF_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : LR_Pin */
-  GPIO_InitStruct.Pin = LR_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(LR_GPIO_Port, &GPIO_InitStruct);
-
 }
 
 /* USER CODE BEGIN 4 */
+
 /**
  * @brief      Wait for a full buffer
  *
  * @return     In case of an buffer overrun return false
  */
+void forward(void) {
+	HAL_GPIO_WritePin(LF_GPIO_Port, LF_Pin, GPIO_PIN_SET);
+	HAL_GPIO_WritePin(RF_GPIO_Port, RF_Pin, GPIO_PIN_SET);
+	//HAL_Delay(time);
+}
+
+void backward(void) {
+	HAL_GPIO_WritePin(LR_GPIO_Port, LR_Pin, GPIO_PIN_SET);
+	HAL_GPIO_WritePin(RR_GPIO_Port, RR_Pin, GPIO_PIN_SET);
+	//HAL_Delay(time);
+}
+
+void left(void) {
+	HAL_GPIO_WritePin(LR_GPIO_Port, LR_Pin, GPIO_PIN_SET);
+	HAL_GPIO_WritePin(RF_GPIO_Port, RF_Pin, GPIO_PIN_SET);
+	//HAL_Delay(time);
+}
+
+void right(void) {
+	HAL_GPIO_WritePin(LF_GPIO_Port, LF_Pin, GPIO_PIN_SET);
+	HAL_GPIO_WritePin(RR_GPIO_Port, RR_Pin, GPIO_PIN_SET);
+	//HAL_Delay(time);
+}
+
+void stop(void) {
+	HAL_GPIO_WritePin(LF_GPIO_Port, LF_Pin, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(RR_GPIO_Port, RR_Pin, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(RF_GPIO_Port, RF_Pin, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(LR_GPIO_Port, LR_Pin, GPIO_PIN_RESET);
+}
+
 bool ei_microphone_inference_record(void)
 {
   bool ret = true;
@@ -489,7 +544,7 @@ bool ei_microphone_inference_record(void)
 bool ei_microphone_inference_end(void)
 {
   // Stop I2S
-  HAL_SAI_DMAStop(&hsai_BlockB1);
+  HAL_I2S_DMAStop(&hi2s2);
 
   // Free up double buffer
   record_ready = false;
@@ -505,13 +560,13 @@ bool ei_microphone_inference_end(void)
  * @param[in]  n_bytes  Number of bytes to copy
  * @param[in]  offset   offset in sampleBuffer
  */
-static void audio_buffer_inference_callback(uint32_t n_bytes, uint32_t offset)
+static void audio_buffer_inference_callback(uint32_t n_samples, uint32_t offset)
 {
   // Copy samples from I2S buffer to inference buffer. Convert 24-bit, 32kHz
   // samples to 16-bit, 16kHz
-  for (uint32_t i = 0; i < (n_bytes >> 1); i++) {
+  for (uint32_t i = 0; i < (n_samples / I2S_BUF_SKIP); i++) {
     inference.buffers[inference.buf_select][inference.buf_count++] =
-        (int16_t)(i2s_buf[offset + (I2S_BUF_SKIP * i)] >> 8);
+        (int16_t)(i2s_buf[offset + (I2S_BUF_SKIP * i)]);
 
     if (inference.buf_count >= inference.n_samples) {
       inference.buf_select ^= 1;
@@ -557,22 +612,22 @@ void ei_printf(const char *format, ...)
 /**
  * Called when the first half of the receive buffer is full
  */
-void HAL_SAI_RxHalfCpltCallback(SAI_HandleTypeDef *hsai)
+void HAL_I2S_RxHalfCpltCallback(I2S_HandleTypeDef *hi2s)
 {
   if (record_ready == true)
   {
-    audio_buffer_inference_callback(I2S_BUF_LEN / I2S_BUF_SKIP, 0);
+    audio_buffer_inference_callback(I2S_BUF_LEN / 2, 0);
   }
 }
 
 /**
  * Called when the second half of the receive buffer is full
  */
-void HAL_SAI_RxCpltCallback(SAI_HandleTypeDef *hsai)
+void HAL_I2S_RxCpltCallback(I2S_HandleTypeDef *hi2s)
 {
   if (record_ready == true)
   {
-    audio_buffer_inference_callback(I2S_BUF_LEN / I2S_BUF_SKIP, I2S_BUF_LEN >> 1);
+    audio_buffer_inference_callback(I2S_BUF_LEN / 2, I2S_BUF_LEN / 2);
   }
 }
 
