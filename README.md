@@ -16,7 +16,7 @@ Present : https://github.com/STM32F4board/Milestone_v2/blob/main/Milestone3.mp4
 Present : https://youtu.be/mCul3-yvNXI
 
 # Milestone 5
-Report : https://github.com/STM32F4board/Milestone_v2/blob/main/Milestone5.docx
+Report : https://github.com/STM32F4board/Milestone_v2/blob/main/Milestone5.pdf
 
 # Milestone 6
 Report : https://github.com/STM32F4board/Milestone_v2/blob/main/Milestone6.pdf
